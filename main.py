@@ -17,15 +17,19 @@ TELETHON_SESSION_STRING = os.environ.get('TELETHON_SESSION')
 SOURCE_CHANNELS_STR = os.environ.get('SOURCE_CHANNELS', '')
 SOURCE_CHANNELS = [ch.strip() for ch in SOURCE_CHANNELS_STR.split(',') if ch.strip()]
 DESTINATION_CHANNEL = os.environ.get('DESTINATION_CHANNEL')
-# --- این خط مقدار را از متغیر محیطی می‌خواند و اگر وجود نداشت، پیش‌فرض را ۱۸۰ قرار می‌دهد ---
 SCHEDULE_INTERVAL_MINUTES = int(os.environ.get('SCHEDULE_INTERVAL_MINUTES', 180))
 PUBLISHER_NAME = os.environ.get('PUBLISHER_NAME', 'DefaultPublisher')
+# <--- جدید: خواندن زمان انتظار از متغیرهای گیت‌هاب با مقدار پیش‌فرض ۴ ساعت
+STATUS_1_TIMEOUT_HOURS = int(os.environ.get('STATUS_1_TIMEOUT_HOURS', 1))
+
 
 # --- تنظیمات محلی ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 STATE_REPO_PATH = 'state-repo'
 QUEUE_FILE_PATH = os.path.join(STATE_REPO_PATH, "post_queue.json")
 STATUS_FILE_PATH = os.path.join(STATE_REPO_PATH, "status.json")
+# <--- جدید: فایل جداگانه برای ذخیره زمان‌سنج
+TIMESTAMP_FILE_PATH = os.path.join(STATE_REPO_PATH, "status_timestamp.json")
 LAST_IDS_FILE = os.path.join(STATE_REPO_PATH, "last_ids.json")
 MEDIA_DIR = "media"
 MAX_CAPTION_LENGTH = 1024 # محدودیت کاراکتر تلگرام برای کپشن
@@ -51,9 +55,19 @@ def get_status():
     status_data = read_json_file(STATUS_FILE_PATH, default_content={"final_status": 0})
     return status_data.get("final_status", 0)
 
+# <--- تغییر: این تابع حالا وضعیت و زمان‌سنج را در فایل‌های جداگانه مدیریت می‌کند
 def update_status(status_value):
     logging.info(f"Updating status to {status_value}")
+    # ۱. فایل وضعیت اصلی را به‌روزرسانی کن
     write_json_file(STATUS_FILE_PATH, {"final_status": status_value})
+
+    # ۲. فایل زمان‌سنج را مدیریت کن
+    if status_value == 1:
+        # اگر وضعیت 1 است، یک زمان‌سنج جدید ثبت کن
+        write_json_file(TIMESTAMP_FILE_PATH, {"timestamp": datetime.utcnow().isoformat()})
+    else:
+        # در غیر این صورت (وقتی وضعیت 0 یا 2 می‌شود)، فایل زمان‌سنج را پاک کن
+        write_json_file(TIMESTAMP_FILE_PATH, {})
 
 def is_post_valid(message, source_channel_username):
     text = message.text
@@ -71,7 +85,6 @@ def is_post_valid(message, source_channel_username):
             return False
     return True
 
-# <--- بهبود: این تابع حالا پیام اصلی گروه را برای ساخت اثرانگشت دریافت می‌کند
 def _create_post_fingerprint(main_message):
     if getattr(main_message, 'text', None):
         return hashlib.md5(main_message.text.strip()[:250].encode()).hexdigest()
@@ -95,16 +108,14 @@ async def schedule_posts_for_publishing(client):
             post_id = post.get("post_id")
             text = post.get("text", "")
             media_path = post.get("media_path")
-            schedule_time = datetime.now() + timedelta(minutes=(scheduled_posts_count + 1) * SCHEDULE_INTERVAL_MINUTES)
+            schedule_time = datetime.utcnow() + timedelta(minutes=(scheduled_posts_count + 1) * SCHEDULE_INTERVAL_MINUTES)
 
-            # <--- تغییر کلیدی: بررسی می‌کند که آیا media_path یک لیست است (برای آلبوم) یا یک رشته
             if media_path:
                 caption_to_send = text
                 if len(text) > MAX_CAPTION_LENGTH:
                     caption_to_send = text[:MAX_CAPTION_LENGTH - 4] + "..."
                     logging.warning(f"Caption for post {post_id} was too long. Truncating it.")
 
-                # بررسی می‌کنیم که آیا مسیرهای رسانه وجود دارند
                 if isinstance(media_path, list):
                     valid_media_paths = [p for p in media_path if os.path.exists(p)]
                 elif isinstance(media_path, str):
@@ -114,22 +125,20 @@ async def schedule_posts_for_publishing(client):
 
                 if valid_media_paths:
                     await client.send_file(DESTINATION_CHANNEL, valid_media_paths, caption=caption_to_send, schedule=schedule_time)
-                    logging.info(f"Post {post_id} with {len(valid_media_paths)} media file(s) scheduled for {schedule_time.strftime('%Y-%m-%d %H:%M')}")
-                    # حذف تمام فایل‌های رسانه‌ای پس از زمان‌بندی
+                    logging.info(f"Post {post_id} with {len(valid_media_paths)} media file(s) scheduled for {schedule_time.strftime('%Y-%m-%d %H:%M')} UTC")
                     for p in valid_media_paths:
                         os.remove(p)
                 else:
                     logging.warning(f"Media for post {post_id} not found. Skipping media part.")
-                    # اگر متنی وجود داشت، آن را به تنهایی ارسال کن
                     if text and text.strip():
                         await client.send_message(DESTINATION_CHANNEL, text, schedule=schedule_time)
-                        logging.info(f"Text part of post {post_id} scheduled for {schedule_time.strftime('%Y-%m-%d %H:%M')}")
+                        logging.info(f"Text part of post {post_id} scheduled for {schedule_time.strftime('%Y-%m-%d %H:%M')} UTC")
                     else:
-                        continue # اگر نه رسانه بود و نه متن، از این پست بگذر
+                        continue
 
             elif text and text.strip():
                 await client.send_message(DESTINATION_CHANNEL, text, schedule=schedule_time)
-                logging.info(f"Text post {post_id} scheduled for {schedule_time.strftime('%Y-%m-%d %H:%M')}")
+                logging.info(f"Text post {post_id} scheduled for {schedule_time.strftime('%Y-%m-%d %H:%M')} UTC")
             else:
                 logging.warning(f"Post {post_id} has no valid text or media. Skipping.")
                 continue
@@ -165,7 +174,6 @@ async def collect_new_posts(client):
         try:
             last_message_id = last_ids.get(channel, 0)
             logging.info(f"Checking {channel} since ID: {last_message_id}...")
-            # <--- بهبود: محدودیت را افزایش می‌دهیم تا پست‌های گروهی بزرگ را از دست ندهیم
             messages = await client.get_messages(channel, min_id=last_message_id, limit=200)
             new_messages = [m for m in messages if m.id > last_message_id]
 
@@ -178,7 +186,6 @@ async def collect_new_posts(client):
                     grouped_messages[group_key].append(msg)
 
                 for group_id, message_group in grouped_messages.items():
-                    # <--- تغییر اصلی: پیدا کردن پیام اصلی (که متن دارد) و متن کپشن
                     main_message = next((msg for msg in message_group if msg.text), message_group[0])
                     caption_text = main_message.text or ""
                     
@@ -187,7 +194,6 @@ async def collect_new_posts(client):
                     fingerprint = _create_post_fingerprint(main_message)
                     if fingerprint and fingerprint in existing_fingerprints: continue
 
-                    # <--- تغییر اصلی: دانلود تمام رسانه‌های گروه و ذخیره مسیر آنها در یک لیست
                     media_paths_in_repo = []
                     for msg in message_group:
                         if msg.media:
@@ -198,22 +204,19 @@ async def collect_new_posts(client):
                             except Exception as dl_error:
                                 logging.error(f"Could not download media for message {msg.id} in group {group_id}: {dl_error}")
 
-                    # اگر هیچ رسانه‌ای دانلود نشد و متنی هم وجود نداشت، از این گروه بگذر
                     if not media_paths_in_repo and not caption_text.strip():
                         continue
                     
-                    # <--- تغییر اصلی: اگر فقط یک رسانه وجود دارد، رشته ذخیره کن، در غیر این صورت لیست
                     final_media_path = None
                     if len(media_paths_in_repo) == 1:
                         final_media_path = media_paths_in_repo[0]
                     elif len(media_paths_in_repo) > 1:
                         final_media_path = media_paths_in_repo
 
-
                     post_queue.append({
                         "post_id": main_message.id,
                         "text": caption_text,
-                        "media_path": final_media_path, # <--- اینجا حالا می‌تواند لیست یا رشته باشد
+                        "media_path": final_media_path,
                         "fingerprint": fingerprint
                     })
                     total_new_posts_count += 1
@@ -230,6 +233,38 @@ async def collect_new_posts(client):
         update_status(1)
     else:
         logging.info("No new messages found.")
+
+async def auto_process_and_set_status_2():
+    """
+    این تابع وقتی وضعیت 1 بیش از حد طول بکشد، فراخوانی می‌شود.
+    متن پست‌ها را با جایگزینی آیدی کانال مبدا با مقصد ویرایش کرده و وضعیت را به 2 تغییر می‌دهد.
+    """
+    logging.info("--- Entering Auto-Processing Mode (Status 1 Timeout) ---")
+    post_queue = read_json_file(QUEUE_FILE_PATH, default_content=[])
+    if not post_queue:
+        logging.warning("Timeout triggered, but post queue is empty. Resetting status to 0.")
+        update_status(0)
+        return
+
+    destination_username = DESTINATION_CHANNEL.lstrip('@')
+    
+    for post in post_queue:
+        text = post.get("text", "")
+        if text:
+            modified_text = text
+            for source_channel in SOURCE_CHANNELS:
+                source_username_without_at = source_channel.lstrip('@')
+                pattern = re.compile(r'@' + re.escape(source_username_without_at) + r'\b', re.IGNORECASE)
+                modified_text = pattern.sub('@' + destination_username, modified_text)
+
+            if modified_text != text:
+                logging.info(f"Replaced source mention in post {post.get('post_id')}.")
+                post["text"] = modified_text
+
+    logging.info("Updating post queue with modified text.")
+    write_json_file(QUEUE_FILE_PATH, post_queue)
+
+    update_status(2)
 
 async def main():
     os.makedirs(MEDIA_DIR, exist_ok=True)
@@ -251,6 +286,27 @@ async def main():
             await schedule_posts_for_publishing(client)
         elif final_status == 0:
             await collect_new_posts(client)
+        elif final_status == 1:
+            # <--- تغییر: خواندن زمان‌سنج از فایل جدید
+            timestamp_data = read_json_file(TIMESTAMP_FILE_PATH)
+            timestamp_str = timestamp_data.get("timestamp") if timestamp_data else None
+            
+            if timestamp_str:
+                status_1_time = datetime.fromisoformat(timestamp_str)
+                time_since_status_1 = datetime.utcnow() - status_1_time
+                
+                # <--- تغییر: استفاده از متغیر برای زمان انتظار
+                timeout_delta = timedelta(hours=STATUS_1_TIMEOUT_HOURS)
+                if time_since_status_1 > timeout_delta:
+                    logging.warning(f"Status 1 has been active for over {STATUS_1_TIMEOUT_HOURS} hours. Triggering auto-publish.")
+                    await auto_process_and_set_status_2()
+                    logging.info("Auto-processing complete. Status set to 2. The next run will publish the posts.")
+                else:
+                    remaining_time = timeout_delta - time_since_status_1
+                    logging.info(f"Status is 1. Waiting for external process. Time left before auto-trigger: {remaining_time}")
+            else:
+                logging.warning("Status is 1 but no timestamp found. Auto-processing to be safe.")
+                await auto_process_and_set_status_2()
         else:
             logging.info(f"Status is {final_status}. No action required. Exiting.")
     
@@ -261,3 +317,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
