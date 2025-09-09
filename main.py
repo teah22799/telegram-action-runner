@@ -19,8 +19,12 @@ SOURCE_CHANNELS = [ch.strip() for ch in SOURCE_CHANNELS_STR.split(',') if ch.str
 DESTINATION_CHANNEL = os.environ.get('DESTINATION_CHANNEL')
 SCHEDULE_INTERVAL_MINUTES = int(os.environ.get('SCHEDULE_INTERVAL_MINUTES', 180))
 PUBLISHER_NAME = os.environ.get('PUBLISHER_NAME', 'DefaultPublisher')
-# <--- تغییر: خواندن زمان انتظار از متغیرهای گیت‌هاب با مقدار پیش‌فرض ۱ ساعت
-STATUS_1_TIMEOUT_HOURS = int(os.environ.get('STATUS_1_TIMEOUT_HOURS', 1))
+
+# <--- تغییر کلیدی برای رفع ارور ---
+# اگر متغیر محیطی وجود نداشت یا خالی بود، مقدار پیش‌فرض ۱ را در نظر می‌گیرد
+timeout_str = os.environ.get('STATUS_1_TIMEOUT_HOURS')
+STATUS_1_TIMEOUT_HOURS = int(timeout_str) if timeout_str else 1
+# ------------------------------------
 
 
 # --- تنظیمات محلی ---
@@ -28,7 +32,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 STATE_REPO_PATH = 'state-repo'
 QUEUE_FILE_PATH = os.path.join(STATE_REPO_PATH, "post_queue.json")
 STATUS_FILE_PATH = os.path.join(STATE_REPO_PATH, "status.json")
-# <--- جدید: فایل جداگانه برای ذخیره زمان‌سنج
 TIMESTAMP_FILE_PATH = os.path.join(STATE_REPO_PATH, "status_timestamp.json")
 LAST_IDS_FILE = os.path.join(STATE_REPO_PATH, "last_ids.json")
 MEDIA_DIR = "media"
@@ -55,18 +58,13 @@ def get_status():
     status_data = read_json_file(STATUS_FILE_PATH, default_content={"final_status": 0})
     return status_data.get("final_status", 0)
 
-# <--- تغییر: این تابع حالا وضعیت و زمان‌سنج را در فایل‌های جداگانه مدیریت می‌کند
 def update_status(status_value):
     logging.info(f"Updating status to {status_value}")
-    # ۱. فایل وضعیت اصلی را به‌روزرسانی کن
     write_json_file(STATUS_FILE_PATH, {"final_status": status_value})
 
-    # ۲. فایل زمان‌سنج را مدیریت کن
     if status_value == 1:
-        # اگر وضعیت 1 است، یک زمان‌سنج جدید ثبت کن
         write_json_file(TIMESTAMP_FILE_PATH, {"timestamp": datetime.utcnow().isoformat()})
     else:
-        # در غیر این صورت (وقتی وضعیت 0 یا 2 می‌شود)، فایل زمان‌سنج را پاک کن
         write_json_file(TIMESTAMP_FILE_PATH, {})
 
 def is_post_valid(message, source_channel_username):
@@ -200,7 +198,7 @@ async def collect_new_posts(client):
                             try:
                                 downloaded_path = await msg.download_media(file=MEDIA_DIR)
                                 if downloaded_path:
-                                    media_paths_in_repo.append(os.path.relpath(downloaded_path, '.'))
+                                    media_paths_in_repo.append(os.path.relpath(download_path, '.'))
                             except Exception as dl_error:
                                 logging.error(f"Could not download media for message {msg.id} in group {group_id}: {dl_error}")
 
@@ -237,7 +235,6 @@ async def collect_new_posts(client):
 async def auto_process_and_set_status_2():
     """
     این تابع وقتی وضعیت 1 بیش از حد طول بکشد، فراخوانی می‌شود.
-    متن پست‌ها را با جایگزینی آیدی کانال مبدا با مقصد ویرایش کرده و وضعیت را به 2 تغییر می‌دهد.
     """
     logging.info("--- Entering Auto-Processing Mode (Status 1 Timeout) ---")
     post_queue = read_json_file(QUEUE_FILE_PATH, default_content=[])
@@ -287,7 +284,6 @@ async def main():
         elif final_status == 0:
             await collect_new_posts(client)
         elif final_status == 1:
-            # <--- تغییر: خواندن زمان‌سنج از فایل جدید
             timestamp_data = read_json_file(TIMESTAMP_FILE_PATH)
             timestamp_str = timestamp_data.get("timestamp") if timestamp_data else None
             
@@ -295,7 +291,6 @@ async def main():
                 status_1_time = datetime.fromisoformat(timestamp_str)
                 time_since_status_1 = datetime.utcnow() - status_1_time
                 
-                # <--- تغییر: استفاده از متغیر برای زمان انتظار
                 timeout_delta = timedelta(hours=STATUS_1_TIMEOUT_HOURS)
                 if time_since_status_1 > timeout_delta:
                     logging.warning(f"Status 1 has been active for over {STATUS_1_TIMEOUT_HOURS} hours. Triggering auto-publish.")
@@ -317,5 +312,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
 
