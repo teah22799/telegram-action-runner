@@ -19,7 +19,7 @@ SOURCE_CHANNELS = [ch.strip() for ch in SOURCE_CHANNELS_STR.split(',') if ch.str
 DESTINATION_CHANNEL = os.environ.get('DESTINATION_CHANNEL')
 SCHEDULE_INTERVAL_MINUTES = int(os.environ.get('SCHEDULE_INTERVAL_MINUTES', 180))
 PUBLISHER_NAME = os.environ.get('PUBLISHER_NAME', 'DefaultPublisher')
-# <--- جدید: خواندن زمان انتظار از متغیرهای گیت‌هاب با مقدار پیش‌فرض ۴ ساعت
+# <--- تغییر: خواندن زمان انتظار از متغیرهای گیت‌هاب با مقدار پیش‌فرض ۱ ساعت
 STATUS_1_TIMEOUT_HOURS = int(os.environ.get('STATUS_1_TIMEOUT_HOURS', 1))
 
 
@@ -317,4 +317,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
