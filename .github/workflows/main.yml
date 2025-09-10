@@ -55,9 +55,12 @@ jobs:
           DESTINATION_CHANNEL: ${{ vars.DESTINATION_CHANNEL }}
           PUBLISHER_NAME: ${{ vars.PUBLISHER_NAME }}
           
-          # اضافه کردن متغیر جدید برای زمان انتظار
-          STATUS_1_TIMEOUT_HOURS: ${{ vars.STATUS_1_TIMEOUT_HOURS }}
           SCHEDULE_INTERVAL_MINUTES: ${{ vars.SCHEDULE_INTERVAL_MINUTES }}
+          
+          # --- جدید: متغیر جدید برای تعیین زمان انقضا ---
+          # این مقدار را می‌توانید در بخش Variables ریپازیتوری خود تنظیم کنید.
+          # اگر تنظیم نشود، اسکریپت از مقدار پیش‌فرض (۴ ساعت) استفاده خواهد کرد.
+          STATUS_TIMEOUT_HOURS: ${{ vars.STATUS_TIMEOUT_HOURS }}
         run: python main.py
 
       # مرحله ۶: کامیت و پوش کردن فایل‌های رسانه‌ای در ریپازیتوری عمومی
@@ -72,23 +75,13 @@ jobs:
           git pull --rebase
           git push
 
-      # مرحله ۷: کامیت و پوش کردن فایل‌های وضعیت در ریپازیتوری خصوصی (با دستورات اشکال‌زدایی)
+      # مرحله ۷: کامیت و پوش کردن فایل‌های وضعیت در ریپازیتوری خصوصی
       - name: Commit and Push State Files (State Repo)
         run: |
           cd state-repo
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          
-          echo "--- (DEBUG) Listing all files in directory: ---"
-          ls -la
-          echo "--- (DEBUG) Git status before adding files: ---"
-          git status
-          
           git add -A
-          
-          echo "--- (DEBUG) Git status after adding files: ---"
-          git status
-          
           git diff-index --quiet HEAD || git commit -m "Update state files"
           git pull --rebase
           git push
