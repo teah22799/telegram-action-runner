@@ -7,7 +7,7 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, MediaCaptionTooLongError
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import sys
 
 # --- ۱. خواندن تنظیمات از متغیرهای محیطی ---
@@ -19,17 +19,21 @@ SOURCE_CHANNELS = [ch.strip() for ch in SOURCE_CHANNELS_STR.split(',') if ch.str
 DESTINATION_CHANNEL = os.environ.get('DESTINATION_CHANNEL')
 SCHEDULE_INTERVAL_MINUTES = int(os.environ.get('SCHEDULE_INTERVAL_MINUTES', 180))
 PUBLISHER_NAME = os.environ.get('PUBLISHER_NAME', 'DefaultPublisher')
-STATUS_TIMEOUT_MINUTES = int(os.environ.get('STATUS_TIMEOUT_MINUTES', 240))  # پیش فرض ۴ ساعت = ۲۴۰ دقیقه
+# --- جدید: خواندن متغیر زمان‌بندی انقضا، با مقدار پیش‌فرض ۴ ساعت ---
+STATUS_TIMEOUT_HOURS = int(os.environ.get('STATUS_TIMEOUT_HOURS', 4))
+
 
 # --- تنظیمات محلی ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 STATE_REPO_PATH = 'state-repo'
 QUEUE_FILE_PATH = os.path.join(STATE_REPO_PATH, "post_queue.json")
 STATUS_FILE_PATH = os.path.join(STATE_REPO_PATH, "status.json")
-STATUS_TIMESTAMP_FILE = os.path.join(STATE_REPO_PATH, "status_timestamp.json")
+# --- جدید: مسیر فایل برای ذخیره زمان آخرین تغییر وضعیت ---
+STATUS_TIMESTAMP_FILE_PATH = os.path.join(STATE_REPO_PATH, "status_timestamp.json")
 LAST_IDS_FILE = os.path.join(STATE_REPO_PATH, "last_ids.json")
 MEDIA_DIR = "media"
 MAX_CAPTION_LENGTH = 1024
+
 
 # --- توابع کمکی ---
 def read_json_file(file_path, default_content=None):
@@ -51,43 +55,17 @@ def get_status():
     status_data = read_json_file(STATUS_FILE_PATH, default_content={"final_status": 0})
     return status_data.get("final_status", 0)
 
-def update_status(status_value, auto=False):
+# --- به‌روزرسانی شده: این تابع حالا زمان تغییر وضعیت را هم ذخیره می‌کند ---
+def update_status(status_value):
     logging.info(f"Updating status to {status_value}")
     write_json_file(STATUS_FILE_PATH, {"final_status": status_value})
-    if status_value == 1 and not auto:
-        write_json_file(STATUS_TIMESTAMP_FILE, {"timestamp": datetime.utcnow().isoformat()})
-
-def check_status_timeout():
-    if not os.path.exists(STATUS_TIMESTAMP_FILE):
-        return False
-    data = read_json_file(STATUS_TIMESTAMP_FILE, default_content={})
-    ts_str = data.get("timestamp")
-    if not ts_str:
-        return False
-    try:
-        ts = datetime.fromisoformat(ts_str)
-        if datetime.utcnow() - ts > timedelta(minutes=STATUS_TIMEOUT_MINUTES):
-            logging.info(f"Status 1 has expired ({STATUS_TIMEOUT_MINUTES} minutes passed). Auto switching to 2.")
-            # تغییر آیدی کانال در post_queue.json
-            post_queue = read_json_file(QUEUE_FILE_PATH, default_content=[])
-            updated_queue = []
-            for post in post_queue:
-                text = post.get("text", "")
-                new_text = re.sub(r"t\.me/\S+", DESTINATION_CHANNEL, text)
-                post["text"] = new_text
-                updated_queue.append(post)
-            write_json_file(QUEUE_FILE_PATH, updated_queue)
-
-            update_status(2, auto=True)
-            return True
-    except Exception as e:
-        logging.error(f"Error checking timeout: {e}")
-    return False
+    # همچنین زمان فعلی را در فایل جداگانه ذخیره می‌کند
+    now_utc_iso = datetime.now(timezone.utc).isoformat()
+    write_json_file(STATUS_TIMESTAMP_FILE_PATH, {"timestamp": now_utc_iso})
 
 def is_post_valid(message, source_channel_username):
     text = message.text
-    if not text:
-        return True
+    if not text: return True
     url_pattern = r'https?://\S+|www\.\S+|t\.me/\S+'
     if re.search(url_pattern, text):
         logging.warning(f"Skipping post {message.id} from {source_channel_username} because it contains a link.")
@@ -107,6 +85,79 @@ def _create_post_fingerprint(main_message):
     if getattr(main_message, 'file', None):
         return f"{main_message.file.size}-{main_message.file.name or ''}"
     return None
+
+# --- جدید: تابعی برای جایگزینی شناسه‌ها در صف پست‌ها ---
+def modify_queue_for_auto_publish():
+    """
+    این تابع صف پست‌ها را برای انتشار خودکار پس از انقضای زمان، ویرایش می‌کند.
+    شناسه‌های کانال مبدا را با شناسه کانال مقصد جایگزین می‌کند.
+    """
+    logging.info("Timeout detected. Modifying queue for auto-publishing.")
+    post_queue = read_json_file(QUEUE_FILE_PATH, default_content=[])
+    if not post_queue:
+        logging.warning("Queue is empty, nothing to modify.")
+        return
+
+    destination_mention = DESTINATION_CHANNEL.lstrip('@')
+    source_mentions = [ch.lstrip('@') for ch in SOURCE_CHANNELS]
+
+    for post in post_queue:
+        if "text" in post and post["text"]:
+            original_text = post["text"]
+            modified_text = original_text
+            for src_mention in source_mentions:
+                # جایگزینی با حساسیت به حروف کوچک و بزرگ برای @mention
+                modified_text = re.sub(f'@{re.escape(src_mention)}', f'@{destination_mention}', modified_text, flags=re.IGNORECASE)
+                # جایگزینی فقط کلمات کامل (برای جلوگیری از جایگزینی بخشی از کلمات دیگر)
+                modified_text = re.sub(r'\b' + re.escape(src_mention) + r'\b', destination_mention, modified_text, flags=re.IGNORECASE)
+
+            if original_text != modified_text:
+                post["text"] = modified_text
+                logging.info(f"Modified text for post ID {post.get('post_id')}")
+
+    write_json_file(QUEUE_FILE_PATH, post_queue)
+    logging.info("Post queue modification complete.")
+
+
+# --- جدید: تابعی برای بررسی انقضای زمان وضعیت ۱ ---
+def check_status_timeout():
+    """
+    بررسی می‌کند که آیا وضعیت ۱ منقضی شده است یا خیر و در صورت لزوم، انتشار خودکار را فعال می‌کند.
+    این تابع بدون نیاز به اتصال به تلگرام کار می‌کند.
+    """
+    current_status = get_status()
+    if current_status != 1:
+        return
+
+    timestamp_data = read_json_file(STATUS_TIMESTAMP_FILE_PATH)
+    if not timestamp_data or "timestamp" not in timestamp_data:
+        logging.warning("Timestamp file not found or invalid. Resetting timestamp.")
+        # اگر فایل وجود نداشت، وضعیت را آپدیت می‌کنیم تا ایجاد شود
+        update_status(1)
+        return
+
+    last_update_str = timestamp_data.get("timestamp")
+    try:
+        last_update_dt = datetime.fromisoformat(last_update_str)
+    except (ValueError, TypeError):
+        logging.error("Invalid timestamp format found. Resetting timestamp.")
+        update_status(1)
+        return
+
+    if last_update_dt.tzinfo is None:
+        last_update_dt = last_update_dt.replace(tzinfo=timezone.utc)
+
+    time_elapsed = datetime.now(timezone.utc) - last_update_dt
+    timeout_delta = timedelta(hours=STATUS_TIMEOUT_HOURS)
+
+    if time_elapsed > timeout_delta:
+        logging.warning(f"Status 1 has been active for {time_elapsed}. Timeout of {STATUS_TIMEOUT_HOURS} hours exceeded.")
+        modify_queue_for_auto_publish()
+        update_status(2)
+        logging.info("Status automatically updated to 2 due to timeout.")
+    else:
+        logging.info(f"Status 1 is active for {time_elapsed}. No timeout yet.")
+
 
 async def schedule_posts_for_publishing(client):
     logging.info("--- Entering Publishing Mode (Status 2) ---")
@@ -204,13 +255,11 @@ async def collect_new_posts(client):
                 for group_id, message_group in grouped_messages.items():
                     main_message = next((msg for msg in message_group if msg.text), message_group[0])
                     caption_text = main_message.text or ""
-
-                    if not is_post_valid(main_message, channel):
-                        continue
-
+                    
+                    if not is_post_valid(main_message, channel): continue
+                    
                     fingerprint = _create_post_fingerprint(main_message)
-                    if fingerprint and fingerprint in existing_fingerprints:
-                        continue
+                    if fingerprint and fingerprint in existing_fingerprints: continue
 
                     media_paths_in_repo = []
                     for msg in message_group:
@@ -224,7 +273,7 @@ async def collect_new_posts(client):
 
                     if not media_paths_in_repo and not caption_text.strip():
                         continue
-
+                    
                     final_media_path = None
                     if len(media_paths_in_repo) == 1:
                         final_media_path = media_paths_in_repo[0]
@@ -238,7 +287,7 @@ async def collect_new_posts(client):
                         "fingerprint": fingerprint
                     })
                     total_new_posts_count += 1
-
+                
                 if grouped_messages:
                     last_ids[channel] = max(m.id for m in new_messages)
         except Exception as e:
@@ -252,34 +301,43 @@ async def collect_new_posts(client):
     else:
         logging.info("No new messages found.")
 
+# --- به‌روزرسانی شده: منطق اصلی برای کارایی بهتر بازنویسی شده است ---
 async def main():
     os.makedirs(MEDIA_DIR, exist_ok=True)
     os.makedirs(STATE_REPO_PATH, exist_ok=True)
 
+    # مرحله ۱: ابتدا وضعیت انقضا را بررسی کنید (بدون نیاز به اتصال به تلگرام)
+    check_status_timeout()
+
+    # مرحله ۲: وضعیت را دوباره بخوانید چون ممکن است تغییر کرده باشد
+    final_status = get_status()
+
+    # مرحله ۳: اگر کاری برای انجام دادن نیست، زودتر خارج شوید
+    if final_status not in [0, 2]:
+        logging.info(f"Status is {final_status}. No action required. Exiting.")
+        return
+
+    # مرحله ۴: حالا که می‌دانیم کاری برای انجام دادن هست، سشن را بررسی و به تلگرام وصل شوید
     if not TELETHON_SESSION_STRING:
         logging.error("TELETHON_SESSION secret is not set!")
         sys.exit(1)
 
     client = TelegramClient(StringSession(TELETHON_SESSION_STRING), API_ID, API_HASH)
-    await client.connect()
-    logging.info("Telegram client connected successfully.")
-
+    
     try:
-        final_status = get_status()
-        if final_status == 1:
-            if check_status_timeout():
-                final_status = 2
+        await client.connect()
+        logging.info("Telegram client connected successfully.")
 
         if final_status == 2:
             await schedule_posts_for_publishing(client)
         elif final_status == 0:
             await collect_new_posts(client)
-        else:
-            logging.info(f"Status is {final_status}. No action required. Exiting.")
-
+    
     finally:
-        await client.disconnect()
-        logging.info("Telegram client disconnected.")
+        if client.is_connected():
+            await client.disconnect()
+            logging.info("Telegram client disconnected.")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
