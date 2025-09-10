@@ -142,6 +142,39 @@ def check_status_timeout():
     else:
         logging.info(f"Status 1 is active for {time_elapsed}. No timeout yet.")
 
+def cleanup_old_media_files():
+    """
+    Deletes files in the media directory that are older than 7 days.
+    """
+    logging.info("--- Running media cleanup ---")
+    now = datetime.now(timezone.utc)
+    cleanup_threshold = timedelta(days=7)
+    deleted_count = 0
+
+    if not os.path.exists(MEDIA_DIR):
+        logging.info("Media directory does not exist. Nothing to clean up.")
+        return
+
+    for filename in os.listdir(MEDIA_DIR):
+        file_path = os.path.join(MEDIA_DIR, filename)
+        if os.path.isfile(file_path):
+            try:
+                # Get file modification time as a timezone-aware datetime object
+                file_mod_time_stamp = os.path.getmtime(file_path)
+                file_mod_datetime = datetime.fromtimestamp(file_mod_time_stamp, timezone.utc)
+                
+                if now - file_mod_datetime > cleanup_threshold:
+                    os.remove(file_path)
+                    logging.info(f"Deleted old media file: {filename}")
+                    deleted_count += 1
+            except Exception as e:
+                logging.error(f"Could not process or delete file {file_path}: {e}")
+
+    if deleted_count > 0:
+        logging.info(f"Cleanup complete. Deleted {deleted_count} old media file(s).")
+    else:
+        logging.info("No old media files found to delete.")
+
 
 async def schedule_posts_for_publishing(client):
     logging.info("--- Entering Publishing Mode (Status 2) ---")
@@ -175,12 +208,32 @@ async def schedule_posts_for_publishing(client):
                     valid_media_paths = []
 
                 if valid_media_paths:
-                    # --- تغییر اصلی: ارسال فایل‌ها به صورت تکی به جای آلبوم ---
-                    for i, path in enumerate(valid_media_paths):
-                        current_caption = caption_to_send if i == 0 else ""
-                        await client.send_file(DESTINATION_CHANNEL, path, caption=current_caption, schedule=schedule_time)
-                        await asyncio.sleep(1) # وقفه کوتاه بین ارسال‌ها
+                    try:
+                        # --- تلاش برای ارسال به صورت آلبوم (اولویت با ظاهر آلبوم) ---
+                        logging.info(f"Attempting to send post {post_id} as a single album.")
+                        await client.send_file(
+                            DESTINATION_CHANNEL,
+                            valid_media_paths,
+                            caption=caption_to_send,
+                            schedule=schedule_time
+                        )
+                    except Exception as album_error:
+                        # --- تغییر جدید: اگر ارسال آلبوم خطا داد، فقط اولین فایل را ارسال کن ---
+                        logging.warning(f"Could not send post {post_id} as an album. Error: {album_error}. Falling back to sending only the first file.")
+                        
+                        if valid_media_paths:
+                            first_media_path = valid_media_paths[0]
+                            await client.send_file(
+                                DESTINATION_CHANNEL,
+                                first_media_path,
+                                caption=caption_to_send,
+                                schedule=schedule_time
+                            )
+                            logging.info(f"Successfully sent the first media file for post {post_id} as a fallback.")
+                        else:
+                            logging.error(f"Fallback failed for post {post_id} because there were no valid media paths.")
 
+                    # در هر صورت (موفق یا جایگزین)، تمام فایل‌های دانلود شده برای این پست حذف می‌شوند.
                     logging.info(f"Post {post_id} with {len(valid_media_paths)} media file(s) scheduled for {schedule_time.strftime('%Y-%m-%d %H:%M')}")
                     for p in valid_media_paths:
                         os.remove(p)
@@ -294,6 +347,8 @@ async def main():
     os.makedirs(MEDIA_DIR, exist_ok=True)
     os.makedirs(STATE_REPO_PATH, exist_ok=True)
 
+    cleanup_old_media_files()
+    
     check_status_timeout()
 
     final_status = get_status()
