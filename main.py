@@ -19,24 +19,17 @@ SOURCE_CHANNELS = [ch.strip() for ch in SOURCE_CHANNELS_STR.split(',') if ch.str
 DESTINATION_CHANNEL = os.environ.get('DESTINATION_CHANNEL')
 SCHEDULE_INTERVAL_MINUTES = int(os.environ.get('SCHEDULE_INTERVAL_MINUTES', 180))
 PUBLISHER_NAME = os.environ.get('PUBLISHER_NAME', 'DefaultPublisher')
-
-# <--- تغییر کلیدی برای رفع ارور ---
-# اگر متغیر محیطی وجود نداشت یا خالی بود، مقدار پیش‌فرض ۱ را در نظر می‌گیرد
-timeout_str = os.environ.get('STATUS_1_TIMEOUT_HOURS')
-STATUS_1_TIMEOUT_HOURS = int(timeout_str) if timeout_str else 1
-# ------------------------------------
-
+STATUS_TIMEOUT_MINUTES = int(os.environ.get('STATUS_TIMEOUT_MINUTES', 240))  # پیش فرض ۴ ساعت = ۲۴۰ دقیقه
 
 # --- تنظیمات محلی ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 STATE_REPO_PATH = 'state-repo'
 QUEUE_FILE_PATH = os.path.join(STATE_REPO_PATH, "post_queue.json")
 STATUS_FILE_PATH = os.path.join(STATE_REPO_PATH, "status.json")
-TIMESTAMP_FILE_PATH = os.path.join(STATE_REPO_PATH, "status_timestamp.json")
+STATUS_TIMESTAMP_FILE = os.path.join(STATE_REPO_PATH, "status_timestamp.json")
 LAST_IDS_FILE = os.path.join(STATE_REPO_PATH, "last_ids.json")
 MEDIA_DIR = "media"
-MAX_CAPTION_LENGTH = 1024 # محدودیت کاراکتر تلگرام برای کپشن
-
+MAX_CAPTION_LENGTH = 1024
 
 # --- توابع کمکی ---
 def read_json_file(file_path, default_content=None):
@@ -58,18 +51,43 @@ def get_status():
     status_data = read_json_file(STATUS_FILE_PATH, default_content={"final_status": 0})
     return status_data.get("final_status", 0)
 
-def update_status(status_value):
+def update_status(status_value, auto=False):
     logging.info(f"Updating status to {status_value}")
     write_json_file(STATUS_FILE_PATH, {"final_status": status_value})
+    if status_value == 1 and not auto:
+        write_json_file(STATUS_TIMESTAMP_FILE, {"timestamp": datetime.utcnow().isoformat()})
 
-    if status_value == 1:
-        write_json_file(TIMESTAMP_FILE_PATH, {"timestamp": datetime.utcnow().isoformat()})
-    else:
-        write_json_file(TIMESTAMP_FILE_PATH, {})
+def check_status_timeout():
+    if not os.path.exists(STATUS_TIMESTAMP_FILE):
+        return False
+    data = read_json_file(STATUS_TIMESTAMP_FILE, default_content={})
+    ts_str = data.get("timestamp")
+    if not ts_str:
+        return False
+    try:
+        ts = datetime.fromisoformat(ts_str)
+        if datetime.utcnow() - ts > timedelta(minutes=STATUS_TIMEOUT_MINUTES):
+            logging.info(f"Status 1 has expired ({STATUS_TIMEOUT_MINUTES} minutes passed). Auto switching to 2.")
+            # تغییر آیدی کانال در post_queue.json
+            post_queue = read_json_file(QUEUE_FILE_PATH, default_content=[])
+            updated_queue = []
+            for post in post_queue:
+                text = post.get("text", "")
+                new_text = re.sub(r"t\.me/\S+", DESTINATION_CHANNEL, text)
+                post["text"] = new_text
+                updated_queue.append(post)
+            write_json_file(QUEUE_FILE_PATH, updated_queue)
+
+            update_status(2, auto=True)
+            return True
+    except Exception as e:
+        logging.error(f"Error checking timeout: {e}")
+    return False
 
 def is_post_valid(message, source_channel_username):
     text = message.text
-    if not text: return True
+    if not text:
+        return True
     url_pattern = r'https?://\S+|www\.\S+|t\.me/\S+'
     if re.search(url_pattern, text):
         logging.warning(f"Skipping post {message.id} from {source_channel_username} because it contains a link.")
@@ -106,7 +124,7 @@ async def schedule_posts_for_publishing(client):
             post_id = post.get("post_id")
             text = post.get("text", "")
             media_path = post.get("media_path")
-            schedule_time = datetime.utcnow() + timedelta(minutes=(scheduled_posts_count + 1) * SCHEDULE_INTERVAL_MINUTES)
+            schedule_time = datetime.now() + timedelta(minutes=(scheduled_posts_count + 1) * SCHEDULE_INTERVAL_MINUTES)
 
             if media_path:
                 caption_to_send = text
@@ -123,20 +141,20 @@ async def schedule_posts_for_publishing(client):
 
                 if valid_media_paths:
                     await client.send_file(DESTINATION_CHANNEL, valid_media_paths, caption=caption_to_send, schedule=schedule_time)
-                    logging.info(f"Post {post_id} with {len(valid_media_paths)} media file(s) scheduled for {schedule_time.strftime('%Y-%m-%d %H:%M')} UTC")
+                    logging.info(f"Post {post_id} with {len(valid_media_paths)} media file(s) scheduled for {schedule_time.strftime('%Y-%m-%d %H:%M')}")
                     for p in valid_media_paths:
                         os.remove(p)
                 else:
                     logging.warning(f"Media for post {post_id} not found. Skipping media part.")
                     if text and text.strip():
                         await client.send_message(DESTINATION_CHANNEL, text, schedule=schedule_time)
-                        logging.info(f"Text part of post {post_id} scheduled for {schedule_time.strftime('%Y-%m-%d %H:%M')} UTC")
+                        logging.info(f"Text part of post {post_id} scheduled for {schedule_time.strftime('%Y-%m-%d %H:%M')}")
                     else:
                         continue
 
             elif text and text.strip():
                 await client.send_message(DESTINATION_CHANNEL, text, schedule=schedule_time)
-                logging.info(f"Text post {post_id} scheduled for {schedule_time.strftime('%Y-%m-%d %H:%M')} UTC")
+                logging.info(f"Text post {post_id} scheduled for {schedule_time.strftime('%Y-%m-%d %H:%M')}")
             else:
                 logging.warning(f"Post {post_id} has no valid text or media. Skipping.")
                 continue
@@ -186,11 +204,13 @@ async def collect_new_posts(client):
                 for group_id, message_group in grouped_messages.items():
                     main_message = next((msg for msg in message_group if msg.text), message_group[0])
                     caption_text = main_message.text or ""
-                    
-                    if not is_post_valid(main_message, channel): continue
-                    
+
+                    if not is_post_valid(main_message, channel):
+                        continue
+
                     fingerprint = _create_post_fingerprint(main_message)
-                    if fingerprint and fingerprint in existing_fingerprints: continue
+                    if fingerprint and fingerprint in existing_fingerprints:
+                        continue
 
                     media_paths_in_repo = []
                     for msg in message_group:
@@ -198,13 +218,13 @@ async def collect_new_posts(client):
                             try:
                                 downloaded_path = await msg.download_media(file=MEDIA_DIR)
                                 if downloaded_path:
-                                    media_paths_in_repo.append(os.path.relpath(download_path, '.'))
+                                    media_paths_in_repo.append(os.path.relpath(downloaded_path, '.'))
                             except Exception as dl_error:
                                 logging.error(f"Could not download media for message {msg.id} in group {group_id}: {dl_error}")
 
                     if not media_paths_in_repo and not caption_text.strip():
                         continue
-                    
+
                     final_media_path = None
                     if len(media_paths_in_repo) == 1:
                         final_media_path = media_paths_in_repo[0]
@@ -218,7 +238,7 @@ async def collect_new_posts(client):
                         "fingerprint": fingerprint
                     })
                     total_new_posts_count += 1
-                
+
                 if grouped_messages:
                     last_ids[channel] = max(m.id for m in new_messages)
         except Exception as e:
@@ -232,37 +252,6 @@ async def collect_new_posts(client):
     else:
         logging.info("No new messages found.")
 
-async def auto_process_and_set_status_2():
-    """
-    این تابع وقتی وضعیت 1 بیش از حد طول بکشد، فراخوانی می‌شود.
-    """
-    logging.info("--- Entering Auto-Processing Mode (Status 1 Timeout) ---")
-    post_queue = read_json_file(QUEUE_FILE_PATH, default_content=[])
-    if not post_queue:
-        logging.warning("Timeout triggered, but post queue is empty. Resetting status to 0.")
-        update_status(0)
-        return
-
-    destination_username = DESTINATION_CHANNEL.lstrip('@')
-    
-    for post in post_queue:
-        text = post.get("text", "")
-        if text:
-            modified_text = text
-            for source_channel in SOURCE_CHANNELS:
-                source_username_without_at = source_channel.lstrip('@')
-                pattern = re.compile(r'@' + re.escape(source_username_without_at) + r'\b', re.IGNORECASE)
-                modified_text = pattern.sub('@' + destination_username, modified_text)
-
-            if modified_text != text:
-                logging.info(f"Replaced source mention in post {post.get('post_id')}.")
-                post["text"] = modified_text
-
-    logging.info("Updating post queue with modified text.")
-    write_json_file(QUEUE_FILE_PATH, post_queue)
-
-    update_status(2)
-
 async def main():
     os.makedirs(MEDIA_DIR, exist_ok=True)
     os.makedirs(STATE_REPO_PATH, exist_ok=True)
@@ -272,44 +261,25 @@ async def main():
         sys.exit(1)
 
     client = TelegramClient(StringSession(TELETHON_SESSION_STRING), API_ID, API_HASH)
-    
     await client.connect()
     logging.info("Telegram client connected successfully.")
 
     try:
         final_status = get_status()
+        if final_status == 1:
+            if check_status_timeout():
+                final_status = 2
 
         if final_status == 2:
             await schedule_posts_for_publishing(client)
         elif final_status == 0:
             await collect_new_posts(client)
-        elif final_status == 1:
-            timestamp_data = read_json_file(TIMESTAMP_FILE_PATH)
-            timestamp_str = timestamp_data.get("timestamp") if timestamp_data else None
-            
-            if timestamp_str:
-                status_1_time = datetime.fromisoformat(timestamp_str)
-                time_since_status_1 = datetime.utcnow() - status_1_time
-                
-                timeout_delta = timedelta(hours=STATUS_1_TIMEOUT_HOURS)
-                if time_since_status_1 > timeout_delta:
-                    logging.warning(f"Status 1 has been active for over {STATUS_1_TIMEOUT_HOURS} hours. Triggering auto-publish.")
-                    await auto_process_and_set_status_2()
-                    logging.info("Auto-processing complete. Status set to 2. The next run will publish the posts.")
-                else:
-                    remaining_time = timeout_delta - time_since_status_1
-                    logging.info(f"Status is 1. Waiting for external process. Time left before auto-trigger: {remaining_time}")
-            else:
-                logging.warning("Status is 1 but no timestamp found. Auto-processing to be safe.")
-                await auto_process_and_set_status_2()
         else:
             logging.info(f"Status is {final_status}. No action required. Exiting.")
-    
+
     finally:
         await client.disconnect()
         logging.info("Telegram client disconnected.")
 
-
 if __name__ == "__main__":
     asyncio.run(main())
-
