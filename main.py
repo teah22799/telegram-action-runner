@@ -20,7 +20,6 @@ DESTINATION_CHANNEL = os.environ.get('DESTINATION_CHANNEL')
 SCHEDULE_INTERVAL_MINUTES = int(os.environ.get('SCHEDULE_INTERVAL_MINUTES', 180))
 PUBLISHER_NAME = os.environ.get('PUBLISHER_NAME', 'DefaultPublisher')
 
-# --- اصلاح شده: این بخش حالا مقادیر خالی را به درستی مدیریت می‌کند ---
 timeout_env_var = os.environ.get('STATUS_TIMEOUT_HOURS')
 STATUS_TIMEOUT_HOURS = int(timeout_env_var) if timeout_env_var else 4
 
@@ -176,7 +175,12 @@ async def schedule_posts_for_publishing(client):
                     valid_media_paths = []
 
                 if valid_media_paths:
-                    await client.send_file(DESTINATION_CHANNEL, valid_media_paths, caption=caption_to_send, schedule=schedule_time)
+                    # --- تغییر اصلی: ارسال فایل‌ها به صورت تکی به جای آلبوم ---
+                    for i, path in enumerate(valid_media_paths):
+                        current_caption = caption_to_send if i == 0 else ""
+                        await client.send_file(DESTINATION_CHANNEL, path, caption=current_caption, schedule=schedule_time)
+                        await asyncio.sleep(1) # وقفه کوتاه بین ارسال‌ها
+
                     logging.info(f"Post {post_id} with {len(valid_media_paths)} media file(s) scheduled for {schedule_time.strftime('%Y-%m-%d %H:%M')}")
                     for p in valid_media_paths:
                         os.remove(p)
